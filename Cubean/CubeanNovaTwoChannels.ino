@@ -11,6 +11,10 @@
  * - Connectivity: Retains full BLE, WiFi AP/STA Mode, WebSockets, and TCP Server for Artisan.
  * - Advanced Control: Retains PID auto-switching, web UI, and auto-shutdown features.
  *
+ * MODIFICATIONS:
+ * - Implements dual-channel temperature reading from both main and panel UARTs
+ * - Adds temperature validation and smoothing
+ *
  * HARDWARE:
  * - Board: WAVESHARE_ESP32_S3_ZERO
  * - UART TX_PIN -> Cubean RX: 20
@@ -30,6 +34,7 @@
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
+#include <HardwareSerial.h>
 
 // -----------------------------------------------------------------------------
 // Debug Settings
@@ -51,6 +56,7 @@
 const int TX_PIN = 20; // UART TX to Cubean RX
 const int RX_PIN = 19; // UART RX from Cubean TX
 const int LED_PIN = 21;
+const int RX_PIN_PAN = 18; // choose free GPIO for extra RX
 const String boardID_BLE = String("CUBEAN_ESP32_S3_ZERO");
 
 // -----------------------------------------------------------------------------
@@ -92,6 +98,9 @@ uint8_t currentHeat = 0;
 uint8_t currentDrum = 0;
 bool isCooling = false;
 
+int prevByteSeven = 0;
+int tempZone = 0;
+
 // PID variables
 double pInput, pOutput, pSetpoint = 0.0;
 double Kp = 12.0, Ki = 0.5, Kd = 5.0;
@@ -124,23 +133,42 @@ void getRoasterMessage();
  * @return Temperature in Celsius.
  */
 float decodeCubeanTemp(uint8_t b2, uint8_t b3) {
-    uint16_t value = (uint16_t(b2) << 8) | b3;
-    float calculatedTemp;
+    const uint16_t value = (static_cast<uint16_t>(b2) << 8) | b3;
 
-    // Tentatively calculate with the low-range formula
-    calculatedTemp = 131.27 - (value / 36.0);
-    if (calculatedTemp <= 80.5) { // Use a 0.5°C buffer for crossover
-        return calculatedTemp;
+    if (tempZone == 0) {
+        // Formula for tempZone 0
+        return (171.66f - 0.04369f * value) /
+               (1.0f + 0.00025976f * value - 1.0052e-7f * value * value);
     }
-
-    // If not low-range, try the mid-range formula
-    calculatedTemp = 367.6 - (0.0755 * value);
-    if (calculatedTemp <= 125.5) { // Use a 0.5°C buffer for the next crossover
-        return calculatedTemp;
+    else if (tempZone == 1) {
+        // Formula for tempZone 1
+        const float arg = constrain(0.00063224f * value - 1.4507f, -1.0f, 1.0f);
+        return -66.198f * asin(arg) + 162.93f;
     }
+    else {
+        return temp;
+    }
+}
+}
 
-    // Otherwise, it must be the very-high-range
-    return 257.49 - (0.0413 * value);
+/**
+ * Reads a 11-byte packet from the extra RX UART
+ * and detect zone.
+ */
+void getPanelMessage() {
+  if (Serial2.available() >= 11) {
+    uint8_t buf[11];
+    int bytesRead = Serial2.readBytes(buf, 11);
+
+    if (bytesRead == 11 && buf[0] == 0xFE && buf[1] == 0xEF) {
+      uint8_t byteSeven = buf[7];
+      if (byteSeven != prevByteSeven) {
+        prevByteSeven = byteSeven;  // Store the new value
+        if (abs(byteSeven - prevByteSeven) == 16){
+            tempZone = (tempZone == 0) ? 1 : 0;
+        }
+      }
+    }
 }
 
 /**
@@ -149,7 +177,7 @@ float decodeCubeanTemp(uint8_t b2, uint8_t b3) {
 
 void sendRoasterMessage() {
     uint8_t fixedByte = 0x02;      // Always 0x02 in roasting mode
-    uint8_t stateByte = 0x26;      // Always roasting mode with drum on
+    //uint8_t stateByte = 0x26;      // Always roasting mode with drum on
 
     uint8_t packet[11] = {
         0xFE, 0xEF,
@@ -157,7 +185,7 @@ void sendRoasterMessage() {
         currentHeat,  // Byte 4: Heater
         currentFan,   // Byte 5: Fan
         fixedByte,    // Byte 6: Fixed value
-        stateByte,    // Byte 7: Mode (Roast + Drum on)
+        prevByteSeven,    // Byte 7: determined by the panel
         0xAA, 0x55,
         0x00          // Checksum placeholder
     };
@@ -538,6 +566,9 @@ void setup() {
 
     Serial1.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
 
+    // Extra RX-only UART
+    Serial2.begin(9600, SERIAL_8N1, EXTRA_RX_PIN, -1); // RX-only
+
     initBLE();
     connectToWifi();
     setupWebServer();
@@ -555,6 +586,7 @@ void loop() {
     static unsigned long lastSendTime = 0;
     const unsigned long sendInterval = 200;
 
+    getPanelMessage();
     getRoasterMessage();
 
     if (millis() - lastSendTime > sendInterval) {
