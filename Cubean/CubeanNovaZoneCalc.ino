@@ -91,6 +91,11 @@ uint8_t currentFan = 0;
 uint8_t currentHeat = 0;
 uint8_t currentDrum = 0;
 bool isCooling = false;
+// track direction
+uint16_t hexTempReading;
+uint16_t hexPrevTempReading;
+int tempZone = 0;
+bool isCooling = false;
 
 // PID variables
 double pInput, pOutput, pSetpoint = 0.0;
@@ -124,23 +129,42 @@ void getRoasterMessage();
  * @return Temperature in Celsius.
  */
 float decodeCubeanTemp(uint8_t b2, uint8_t b3) {
-    uint16_t value = (uint16_t(b2) << 8) | b3;
-    float calculatedTemp;
+    const uint16_t value = (static_cast<uint16_t>(b2) << 8) | b3;
+    const uint16_t lastValue = hexTempReading;
+    const uint16_t previousValue = hexPrevTempReading;
 
-    // Tentatively calculate with the low-range formula
-    calculatedTemp = 131.27 - (value / 36.0);
-    if (calculatedTemp <= 80.5) { // Use a 0.5°C buffer for crossover
-        return calculatedTemp;
+    // Update globals for next call
+    hexPrevTempReading = hexTempReading;
+    hexTempReading = value;
+
+    // Initialization case (first valid reading)
+    if (lastValue == 0 && previousValue == 0) {
+        tempZone = 0;
+        return (171.66f - 0.04369f * value) /
+               (1.0f + 0.00025976f * value - 1.0052e-7f * value * value);
     }
 
-    // If not low-range, try the mid-range formula
-    calculatedTemp = 367.6 - (0.0755 * value);
-    if (calculatedTemp <= 125.5) { // Use a 0.5°C buffer for the next crossover
-        return calculatedTemp;
+    const int transitionTest = abs(2 * value - lastValue - previousValue);
+    const int stabilityTest = abs(value - lastValue);
+
+    // Zone transition has priority
+    if (transitionTest > 1700) {
+        //tempZone = !tempZone; // Toggle zone
+        tempZone = (tempZone == 0) ? 1 : 0;
+    }
+    // Only check stability if no transition occurred
+    else if (stabilityTest >= 70) {
+        return temp; // Return last stable temp if unstable
     }
 
-    // Otherwise, it must be the very-high-range
-    return 257.49 - (0.0413 * value);
+    // Apply current zone's formula (for transitions or stable readings)
+    if (tempZone == 0) {
+        return (171.66f - 0.04369f * value) /
+               (1.0f + 0.00025976f * value - 1.0052e-7f * value * value);
+    } else {
+        const float arg = constrain(0.00063224f * value - 1.4507f, -1.0f, 1.0f);
+        return -66.198f * asin(arg) + 162.93f;
+    }
 }
 
 /**
