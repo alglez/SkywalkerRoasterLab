@@ -1,20 +1,30 @@
 /*********************************************************************************************************
- * ESP32S3-Zero_Cubean_Roaster Control_v2.2 (For Artisan + HiBean)
+ * ESP32S3-Zero_Cubean_Roaster Control_v2.3 (For Artisan + HiBean)
  *
- * This is the complete, corrected code for controlling a Cubean roaster with an ESP32-S3.
- * It merges a feature-rich controller base with the reverse-engineered Cubean protocol.
+ * Enhanced version with improved temperature zone detection and advanced formula system for Cubean roasters.
+ * Combines robust control features with precise temperature measurement algorithms.
  *
- * KEY FEATURES:
+ * KEY ENHANCEMENTS:
+ * - Smart Zone Detection: Dynamic switching between temperature ranges using advanced transition logic
+ * - Three-Phase Formula System:
+ *   - Zone 0 (Low Temp): Polynomial fit (171.66 - 0.04369x)/(1 + 0.00025976x - 1.0052e-7x²)
+ *   - Zone 1 (High Temp): Inverse sine model (-66.198*asin(0.00063224x - 1.4507) + 162.93)
+ *   - Transition Logic: Directional change detection with hysteresis for stable readings
+ * - Adaptive Filtering: Plausibility checks and noise rejection for stable temperature reporting
+ *
+ * CORE FEATURES:
  * - Communication: Standard UART (Serial1) for sending and receiving 11-byte FE EF packets.
  * - Temperature Decoding: Implements the verified three-formula system for high accuracy.
  * - Checksum Calculation: Dynamically calculates the correct checksum for all outgoing commands.
  * - Connectivity: Retains full BLE, WiFi AP/STA Mode, WebSockets, and TCP Server for Artisan.
  * - Advanced Control: Retains PID auto-switching, web UI, and auto-shutdown features.
  *
- * HARDWARE:
- * - Board: WAVESHARE_ESP32_S3_ZERO
- * - UART TX_PIN -> Cubean RX: 20
- * - UART RX_PIN <- Cubean TX: 19
+ * HARDWARE CONFIGURATION:
+ * - Board: WAVESHARE ESP32-S3-ZERO
+ * - UART Interface:
+ *   - TX -> Cubean RX: GPIO 20
+ *   - RX <- Cubean TX: GPIO 19
+ *
  *********************************************************************************************************/
 
 #include <Arduino.h>
@@ -91,7 +101,6 @@ uint8_t currentFan = 0;
 uint8_t currentHeat = 0;
 uint8_t currentDrum = 0;
 bool isCooling = false;
-// track direction
 uint16_t hexTempReading;
 uint16_t hexPrevTempReading;
 int tempZone = 0;
@@ -128,34 +137,44 @@ void getRoasterMessage();
  * @param b3 Byte 3 from the packet (index 3).
  * @return Temperature in Celsius.
  */
+//add ignore same values
 float decodeCubeanTemp(uint8_t b2, uint8_t b3) {
     const uint16_t value = (static_cast<uint16_t>(b2) << 8) | b3;
     const uint16_t lastValue = hexTempReading;
     const uint16_t previousValue = hexPrevTempReading;
 
-    // Update globals for next call
-    hexPrevTempReading = hexTempReading;
-    hexTempReading = value;
-
     // Initialization case (first valid reading)
     if (lastValue == 0 && previousValue == 0) {
         tempZone = 0;
+        hexPrevTempReading = hexTempReading;
+        hexTempReading = value;
         return (171.66f - 0.04369f * value) /
                (1.0f + 0.00025976f * value - 1.0052e-7f * value * value);
+    }
+    else if (value == lastValue){
+       return temp;
     }
 
     const int transitionTest = abs(2 * value - lastValue - previousValue);
     const int stabilityTest = abs(value - lastValue);
 
+    // test direction change.
+    bool directionChanged = ((value > lastValue) - (value < lastValue)) *
+                        ((lastValue > previousValue) - (lastValue < previousValue)) < 0;
+
     // Zone transition has priority
-    if (transitionTest > 1700) {
+    if (transitionTest > 1600) {
         //tempZone = !tempZone; // Toggle zone
         tempZone = (tempZone == 0) ? 1 : 0;
     }
     // Only check stability if no transition occurred
-    else if (stabilityTest >= 70) {
+    else if (stabilityTest >= 70 && directionChanged) {
         return temp; // Return last stable temp if unstable
     }
+
+    // Update globals for next call
+    hexPrevTempReading = hexTempReading;
+    hexTempReading = value;
 
     // Apply current zone's formula (for transitions or stable readings)
     if (tempZone == 0) {
